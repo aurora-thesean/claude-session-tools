@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""
+claude-session — Fork-aware CLI for Claude Code session inspection.
+
+Usage:
+    claude-session list              List all sessions
+    claude-session search <query>   Search all sessions (fork-aware)
+    claude-session tree <id>         Show conversation tree for session
+    claude-session forks <id>        Show fork points in session
+    claude-session branch <id> <uuid> Show a specific branch
+
+The key difference from every other tool: this correctly understands
+that Claude Code JSONL files are TREES, not linear logs. A fork occurs
+when two records share the same parentUuid. See lib/session_tree.py.
+"""
+
+import sys
+import os
+
+# Allow running from the package directory without install
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+
+from session_tree import all_sessions, find_session, SessionTree
+from pathlib import Path
+
+
+def cmd_list(args):
+    sessions = all_sessions()
+    for s in sorted(sessions, key=lambda x: str(x.path)):
+        project = s.path.parent.name
+        forks = len(s.fork_points())
+        session_ids = len(s.session_ids)
+        records = len(s.records)
+        fork_str = f"  {forks} fork(s)" if forks else ""
+        multi_str = f"  [{session_ids} session IDs]" if session_ids > 1 else ""
+        print(f"{s.session_id[:8]}  {project:<50} {records:>5} records{fork_str}{multi_str}")
+
+
+def cmd_search(args):
+    if not args:
+        print("Usage: claude-session search <query>", file=sys.stderr)
+        sys.exit(1)
+    query = " ".join(args)
+    sessions = all_sessions()
+    found = 0
+    for s in sessions:
+        results = s.search(query)
+        for rec, ancestors in results:
+            found += 1
+            branch_note = ""
+            # Is this record on a non-primary branch?
+            forks = s.fork_points()
+            for parent_uuid, children in forks:
+                if rec.uuid in children and children.index(rec.uuid) > 0:
+                    branch_note = "  [non-primary branch]"
+            ts = rec.timestamp[:19]
+            print(f"\n[{s.session_id[:8]}] {ts} ({rec.role()}){branch_note}")
+            # Show 2 ancestors for context
+            for anc in ancestors[-2:]:
+                if anc.uuid == rec.uuid:
+                    continue
+                snippet = anc.text()[:80].replace("\n", " ")
+                print(f"  ↑ [{anc.role()[:1]}] {snippet}")
+            # Show the matching text with query highlighted
+            text = rec.text()
+            idx = text.lower().find(query.lower())
+            if idx >= 0:
+                start = max(0, idx - 60)
+                end = min(len(text), idx + len(query) + 60)
+                snippet = text[start:end].replace("\n", " ")
+                print(f"  → …{snippet}…")
+    if found == 0:
+        print(f"No results for: {query}")
+    else:
+        print(f"\n{found} result(s) across {len(sessions)} session(s)")
+
+
+def cmd_tree(args):
+    if not args:
+        print("Usage: claude-session tree <session-id-prefix>", file=sys.stderr)
+        sys.exit(1)
+    s = find_session(args[0])
+    if not s:
+        print(f"Session not found: {args[0]}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Session: {s.session_id}")
+    print(f"File:    {s.path}")
+    print(f"Records: {len(s.records)}")
+    print(f"Session IDs in file: {', '.join(sid[:8] for sid in s.session_ids)}")
+    forks = s.fork_points()
+    print(f"Fork points: {len(forks)}")
+    print()
+
+    def render_node(uuid, depth=0, prefix=""):
+        rec = s.records.get(uuid)
+        if not rec:
+            return
+        ts = rec.timestamp[11:19] if rec.timestamp else "??:??:??"
+        snippet = rec.text()[:60].replace("\n", " ")
+        role = rec.role()[:1].upper()
+        kids = s.children.get(uuid, [])
+        fork_marker = " ◆ FORK" if len(kids) > 1 else ""
+        print(f"{'  ' * depth}{prefix}[{role}] {ts}  {snippet}{fork_marker}")
+        for i, kid in enumerate(kids):
+            branch_prefix = "├─ " if i < len(kids) - 1 else "└─ "
+            render_node(kid, depth + 1, branch_prefix)
+
+    for root in s.roots:
+        render_node(root)
+
+
+def cmd_forks(args):
+    if not args:
+        print("Usage: claude-session forks <session-id-prefix>", file=sys.stderr)
+        sys.exit(1)
+    s = find_session(args[0])
+    if not s:
+        print(f"Session not found: {args[0]}", file=sys.stderr)
+        sys.exit(1)
+
+    forks = s.fork_points()
+    if not forks:
+        print("No fork points found.")
+        return
+
+    print(f"{len(forks)} fork point(s) in {s.session_id[:8]}:\n")
+    for parent_uuid, children in forks:
+        parent = s.records.get(parent_uuid)
+        ts = parent.timestamp[:19] if parent else "?"
+        snippet = parent.text()[:80].replace("\n", " ") if parent else "?"
+        print(f"Fork at {parent_uuid[:8]}  {ts}")
+        print(f"  Last shared message: {snippet}")
+        for i, child_uuid in enumerate(children):
+            child = s.records.get(child_uuid)
+            if not child:
+                continue
+            cts = child.timestamp[:19]
+            csnippet = child.text()[:60].replace("\n", " ")
+            print(f"  Branch {i+1}: [{child.role()}] {cts}  {csnippet}")
+        print()
+
+
+def cmd_branch(args):
+    if len(args) < 2:
+        print("Usage: claude-session branch <session-id-prefix> <uuid-prefix>", file=sys.stderr)
+        sys.exit(1)
+    s = find_session(args[0])
+    if not s:
+        print(f"Session not found: {args[0]}", file=sys.stderr)
+        sys.exit(1)
+
+    uuid_prefix = args[1]
+    start_uuid = next((u for u in s.records if u.startswith(uuid_prefix)), None)
+    if not start_uuid:
+        print(f"UUID not found: {uuid_prefix}", file=sys.stderr)
+        sys.exit(1)
+
+    records = s.branch(start_uuid)
+    for rec in records:
+        ts = rec.timestamp[:19]
+        role = rec.role()
+        text = rec.text()[:200].replace("\n", " ")
+        print(f"[{role}] {ts}  {text}")
+
+
+COMMANDS = {
+    "list": cmd_list,
+    "search": cmd_search,
+    "tree": cmd_tree,
+    "forks": cmd_forks,
+    "branch": cmd_branch,
+}
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        sys.exit(0)
+
+    cmd = args[0]
+    if cmd not in COMMANDS:
+        print(f"Unknown command: {cmd}\nCommands: {', '.join(COMMANDS)}", file=sys.stderr)
+        sys.exit(1)
+
+    COMMANDS[cmd](args[1:])
+
+
+if __name__ == "__main__":
+    main()
