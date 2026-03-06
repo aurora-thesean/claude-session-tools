@@ -18,7 +18,7 @@ import sys
 import os
 
 # Allow running from the package directory without install
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 
 from session_tree import all_sessions, find_session, SessionTree
 from pathlib import Path
